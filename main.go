@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,49 +43,111 @@ type RequestBody struct {
 	Wifi []WifiNetwork `json:"wifi,omitempty"`
 }
 
-// YandexResponse ответ от API
+// YandexResponse обновленная структура ответа от API
 type YandexResponse struct {
 	Location struct {
-		Lat float64 `json:"lat"`
-		Lng float64 `json:"lon"`
-	} `json:"location.point"`
+		Point struct {
+			Lon float64 `json:"lon"`
+			Lat float64 `json:"lat"`
+		} `json:"point"`
+		Accuracy float64 `json:"accuracy"`
+	} `json:"location"`
+	Raw map[string]interface{} `json:"-"` // для хранения полного ответа
 }
+
+// LocationResponse структура для сохранения в файл
+type LocationResponse struct {
+	Timestamp string `json:"timestamp"`
+	Hostname  string `json:"hostname"`
+	Location  struct {
+		Point struct {
+			Lon float64 `json:"lon"`
+			Lat float64 `json:"lat"`
+		} `json:"point"`
+		Accuracy float64 `json:"accuracy"`
+	} `json:"location"`
+}
+
+// Logger структура для условного логирования
+type Logger struct {
+	quiet bool
+}
+
+func (l *Logger) Println(a ...interface{}) {
+	if !l.quiet {
+		fmt.Println(a...)
+	}
+}
+
+func (l *Logger) Printf(format string, a ...interface{}) {
+	if !l.quiet {
+		fmt.Printf(format, a...)
+	}
+}
+
+func (l *Logger) Errorln(a ...interface{}) {
+	// Ошибки выводим всегда
+	fmt.Fprintln(os.Stderr, a...)
+}
+
+func (l *Logger) Errorf(format string, a ...interface{}) {
+	// Ошибки выводим всегда
+	fmt.Fprintf(os.Stderr, format, a...)
+}
+
+var log Logger
 
 func init() {
 	// Загружаем .env файл
 	_ = godotenv.Load()
 	yandexAPIKey = os.Getenv("YANDEX_API_KEY")
 	if yandexAPIKey == "" {
-		fmt.Println("Ошибка: не задан YANDEX_API_KEY в .env файле или переменных окружения.")
-		fmt.Println("Создайте файл .env с содержимым: YANDEX_API_KEY=ваш_ключ")
+		fmt.Fprintln(os.Stderr, "Ошибка: не задан YANDEX_API_KEY в .env файле или переменных окружения.")
+		fmt.Fprintln(os.Stderr, "Создайте файл .env с содержимым: YANDEX_API_KEY=ваш_ключ")
 		os.Exit(1)
 	}
 }
 
 func main() {
-	fmt.Println("Утилита определения геолокации")
-	fmt.Println("===============================")
+	// Парсим флаги командной строки
+	quiet := flag.Bool("quiet", false, "тихий режим (вывод только ошибок и кода ответа)")
+	flag.Parse()
+	
+	log = Logger{quiet: *quiet}
 
-	// 1. Публичный IP
-	publicIP := getPublicIP()
-	if publicIP == "" {
-		fmt.Println("Ошибка: не удалось получить публичный IP. Проверьте интернет-соединение.")
-	} else {
-		fmt.Printf("Публичный IP: %s\n", publicIP)
+	if !log.quiet {
+		fmt.Println("Утилита определения геолокации")
+		fmt.Println("===============================")
 	}
 
-	// 2. Wi-Fi сети
-	fmt.Println("\nСканируем Wi-Fi сети...")
-	wifiNetworks := getWifiNetworks()
-	fmt.Printf("Найдено уникальных Wi-Fi сетей: %d\n", len(wifiNetworks))
+	// 1. Получаем hostname
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+		log.Errorf("Предупреждение: не удалось получить hostname: %v\n", err)
+	}
+	log.Printf("Hostname: %s\n", hostname)
 
-	// 3. Проверка наличия данных
+	// 2. Публичный IP
+	publicIP := getPublicIP()
+	if publicIP == "" {
+		log.Errorln("Ошибка: не удалось получить публичный IP. Проверьте интернет-соединение.")
+	} else {
+		log.Printf("Публичный IP: %s\n", publicIP)
+	}
+
+	// 3. Wi-Fi сети
+	log.Println("\nСканируем Wi-Fi сети...")
+	wifiNetworks := getWifiNetworks()
+	log.Printf("Найдено уникальных Wi-Fi сетей: %d\n", len(wifiNetworks))
+
+	// 4. Проверка наличия данных
 	if len(wifiNetworks) == 0 && publicIP == "" {
-		fmt.Println("\nОшибка: нет данных для отправки.")
+		log.Errorln("\nОшибка: нет данных для отправки.")
 		os.Exit(1)
 	}
 
-	// 4. Формирование JSON
+	// 5. Формирование JSON
 	requestBody := RequestBody{
 		IP: []IPAddress{{Address: publicIP}},
 	}
@@ -94,30 +157,58 @@ func main() {
 
 	jsonData, err := json.MarshalIndent(requestBody, "", "  ")
 	if err != nil {
-		fmt.Printf("Ошибка формирования JSON: %v\n", err)
+		log.Errorf("Ошибка формирования JSON: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("\nJSON для отправки:")
-	fmt.Println(string(jsonData))
+	log.Println("\nJSON для отправки:")
+	log.Println(string(jsonData))
 
-	// 5. Отправка запроса
-	fmt.Println("\nОтправляем запрос на Яндекс API...")
-	resp, err := sendRequest(jsonData)
+	// 6. Отправка запроса
+	log.Println("\nОтправляем запрос на Яндекс API...")
+	resp, rawResponse, statusCode, err := sendRequest(jsonData)
 	if err != nil {
-		fmt.Printf("Ошибка: %v\n", err)
+		log.Errorf("Ошибка: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("Запрос успешно отправлен! (HTTP 200)")
-
-	// 6. Вывод координат
-	if resp.Location.Lat != 0 || resp.Location.Lng != 0 {
-		fmt.Printf("\nКоординаты: %f, %f\n", resp.Location.Lat, resp.Location.Lng)
-		fmt.Printf("Ссылка на карту: https://maps.yandex.ru/?ll=%f,%f&z=17\n", resp.Location.Lng, resp.Location.Lat)
-	} else {
-		fmt.Println("\nПредупреждение: координаты не найдены в ответе сервера.")
+	
+	// Всегда выводим код ответа
+	fmt.Printf("HTTP Status: %d\n", statusCode)
+	
+	if !log.quiet {
+		fmt.Println("Запрос успешно отправлен! (HTTP 200)")
 	}
 
-	// 7. Статистика
+	// 7. Вывод полного ответа сервера (только если не quiet)
+	if !log.quiet {
+		fmt.Println("\nПолный ответ сервера:")
+		fmt.Println(string(rawResponse))
+	}
+
+	// 8. Вывод координат в нужном формате (только если не quiet)
+	if resp != nil && resp.Location.Point.Lat != 0 && resp.Location.Point.Lon != 0 {
+		log.Printf("\nКоординаты: %.6f, %.6f\n", resp.Location.Point.Lat, resp.Location.Point.Lon)
+		log.Printf("Ссылка на карту: https://maps.yandex.ru/?ll=%.6f,%.6f&z=17\n", 
+			resp.Location.Point.Lon, resp.Location.Point.Lat)
+		
+		// Вывод точности, если она есть
+		if resp.Location.Accuracy > 0 {
+			log.Printf("Точность: %.1f метров\n", resp.Location.Accuracy)
+		}
+	} else {
+		log.Println("\nПредупреждение: координаты не найдены в ответе сервера.")
+	}
+
+	// 9. Сохранение результата в файл
+	if resp != nil {
+		err = saveResult(hostname, resp)
+		if err != nil {
+			log.Errorf("Ошибка сохранения результата: %v\n", err)
+		} else {
+			log.Println("Результат сохранен в output.json")
+		}
+	}
+
+	// 10. Статистика (только если не quiet)
 	printStats(wifiNetworks)
 }
 
@@ -139,13 +230,13 @@ func getPublicIP() string {
 
 // getWifiNetworks получает список всех точек доступа через netsh
 func getWifiNetworks() []WifiNetwork {
-	fmt.Println("  Используем netsh для сканирования...")
+	log.Println("  Используем netsh для сканирования...")
 	
 	// Запускаем netsh
 	cmd := exec.Command("netsh", "wlan", "show", "networks", "mode=bssid")
 	output, err := cmd.Output()
 	if err != nil {
-		fmt.Printf("  Ошибка запуска netsh: %v\n", err)
+		log.Printf("  Ошибка запуска netsh: %v\n", err)
 		return nil
 	}
 
@@ -225,39 +316,82 @@ func getWifiNetworks() []WifiNetwork {
 	return unique
 }
 
-// sendRequest выполняет POST запрос
-func sendRequest(jsonData []byte) (YandexResponse, error) {
-	var response YandexResponse
+// sendRequest выполняет POST запрос и возвращает как структуру, так и сырой ответ и код статуса
+func sendRequest(jsonData []byte) (*YandexResponse, []byte, int, error) {
 	fullURL := fmt.Sprintf("%s?apikey=%s", apiURL, yandexAPIKey)
 	client := http.Client{Timeout: timeoutSec * time.Second}
 	req, err := http.NewRequest("POST", fullURL, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return response, err
+		return nil, nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return response, err
+		return nil, nil, 0, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return response, err
+		return nil, nil, resp.StatusCode, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return response, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, body, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
+	// Парсим ответ в структуру
+	var response YandexResponse
 	err = json.Unmarshal(body, &response)
-	return response, err
+	if err != nil {
+		// Если не удалось распарсить в структуру, всё равно возвращаем сырой ответ
+		return nil, body, resp.StatusCode, nil
+	}
+
+	return &response, body, resp.StatusCode, nil
+}
+
+// saveResult сохраняет результат в файл output.json
+func saveResult(hostname string, yandexResp *YandexResponse) error {
+	// Создаем структуру для сохранения
+	var locationResp LocationResponse
+	
+	// Устанавливаем timestamp в формате ISO 8601
+	locationResp.Timestamp = time.Now().Format(time.RFC3339)
+	
+	// Устанавливаем hostname
+	locationResp.Hostname = hostname
+	
+	// Устанавливаем координаты
+	locationResp.Location.Point.Lon = yandexResp.Location.Point.Lon
+	locationResp.Location.Point.Lat = yandexResp.Location.Point.Lat
+	
+	// Устанавливаем точность
+	locationResp.Location.Accuracy = yandexResp.Location.Accuracy
+
+	// Конвертируем в JSON с отступами
+	jsonData, err := json.MarshalIndent(locationResp, "", "  ")
+	if err != nil {
+		return fmt.Errorf("ошибка маршалинга JSON: %v", err)
+	}
+
+	// Сохраняем в файл
+	err = os.WriteFile("output.json", jsonData, 0644)
+	if err != nil {
+		return fmt.Errorf("ошибка записи файла: %v", err)
+	}
+
+	// Для отладки выводим сохраненный JSON (только если не quiet)
+	log.Println("\nСохраненный JSON:")
+	log.Println(string(jsonData))
+
+	return nil
 }
 
 // printStats выводит статистику
 func printStats(networks []WifiNetwork) {
-	if len(networks) == 0 {
+	if len(networks) == 0 || log.quiet {
 		return
 	}
 	fmt.Println("\nСтатистика:")
