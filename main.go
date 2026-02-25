@@ -13,7 +13,7 @@ import (
 	"sort"
 	"strings"
 	"time"
-
+    "strconv"
 	"github.com/joho/godotenv"
 )
 
@@ -230,90 +230,101 @@ func getPublicIP() string {
 
 // getWifiNetworks получает список всех точек доступа через netsh
 func getWifiNetworks() []WifiNetwork {
-	log.Println("  Используем netsh для сканирования...")
-	
-	// Запускаем netsh
-	cmd := exec.Command("netsh", "wlan", "show", "networks", "mode=bssid")
-	output, err := cmd.Output()
-	if err != nil {
-		log.Printf("  Ошибка запуска netsh: %v\n", err)
-		return nil
-	}
+    log.Println("  Используем netsh для сканирования...")
+    cmd := exec.Command("cmd", "/c", "chcp 437 > nul && netsh wlan show networks mode=bssid")
 
-	// Парсим вывод netsh
-	lines := strings.Split(string(output), "\r\n")
-	var networks []WifiNetwork
-	var currentBSSID string
-	var currentChannel int
-	var currentSignal int
-	
-	// Регулярные выражения для поиска
-	bssidRegex := regexp.MustCompile(`BSSID\s+\d+\s+:\s*([0-9A-Fa-f:]{17})`)
-	signalRegex := regexp.MustCompile(`Сигнал\s+:\s*(\d+)%`)
-	channelRegex := regexp.MustCompile(`Канал\s+:\s*(\d+)`)
+    output, err := cmd.Output()
+	fmt.Println("=== RAW NETSH OUTPUT ===")
+    fmt.Println(string(output))
+    fmt.Println("=== END RAW OUTPUT ===")
+    if err != nil {
+        log.Printf("  Ошибка запуска netsh: %v\n", err)
+        return nil
+    }
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		
-		// Поиск BSSID
-		if matches := bssidRegex.FindStringSubmatch(line); matches != nil {
-			// Сохраняем предыдущую точку, если она есть
-			if currentBSSID != "" && currentChannel != 0 && currentSignal != 0 {
-				networks = append(networks, WifiNetwork{
-					BSSID:           currentBSSID,
-					Channel:         currentChannel,
-					SignalStrength:  currentSignal,
-					Age:             0,
-				})
-			}
-			// Начинаем новую точку
-			currentBSSID = matches[1]
-			currentChannel = 0
-			currentSignal = 0
-			continue
-		}
-		
-		// Поиск сигнала
-		if matches := signalRegex.FindStringSubmatch(line); matches != nil && currentBSSID != "" {
-			fmt.Sscanf(matches[1], "%d", &currentSignal)
-			// Конвертируем процент в dBm
-			currentSignal = (currentSignal * 70 / 100) - 100
-			continue
-		}
-		
-		// Поиск канала
-		if matches := channelRegex.FindStringSubmatch(line); matches != nil && currentBSSID != "" {
-			fmt.Sscanf(matches[1], "%d", &currentChannel)
-			continue
-		}
-	}
+    // Для отладки можно раскомментировать:
+    // fmt.Println(string(output))
 
-	// Добавляем последнюю найденную точку
-	if currentBSSID != "" && currentChannel != 0 && currentSignal != 0 {
-		networks = append(networks, WifiNetwork{
-			BSSID:           currentBSSID,
-			Channel:         currentChannel,
-			SignalStrength:  currentSignal,
-			Age:             0,
-		})
-	}
+    // Разделяем вывод на блоки сетей (два перевода строки)
+    blocks := strings.Split(string(output), "\r\n\r\n")
+    var networks []WifiNetwork
 
-	// Удаляем дубликаты по BSSID
-	seen := make(map[string]bool)
-	var unique []WifiNetwork
-	for _, net := range networks {
-		if !seen[net.BSSID] {
-			seen[net.BSSID] = true
-			unique = append(unique, net)
-		}
-	}
+    for _, block := range blocks {
+        // Блок должен содержать BSSID, иначе это не сеть
+        if !strings.Contains(block, "BSSID") {
+            continue
+        }
 
-	// Сортируем по силе сигнала (от сильного к слабому)
-	sort.Slice(unique, func(i, j int) bool {
-		return unique[i].SignalStrength > unique[j].SignalStrength
-	})
+        lines := strings.Split(block, "\r\n")
+        var bssid, signalStr, channelStr string
 
-	return unique
+        for _, line := range lines {
+            line = strings.TrimSpace(line)
+
+            // Поиск BSSID
+            if strings.Contains(line, "BSSID") {
+                // Ожидается формат "BSSID 1 : xx:xx:xx:xx:xx:xx" или "BSSID : xx:xx..."
+                parts := strings.SplitN(line, ":", 2)
+                if len(parts) == 2 {
+                    bssid = strings.TrimSpace(parts[1])
+                    // Проверим, что это похоже на MAC-адрес (опционально)
+                    if matched, _ := regexp.MatchString(`([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}`, bssid); !matched {
+                        bssid = "" // сброс, если не похоже
+                    }
+                }
+                continue
+            }
+
+            // Поиск сигнала (русский или английский)
+            if strings.Contains(line, "Сигнал") || strings.Contains(line, "Signal") {
+                re := regexp.MustCompile(`(\d+)%`)
+                if matches := re.FindStringSubmatch(line); matches != nil {
+                    signalStr = matches[1]
+                }
+                continue
+            }
+
+            // Поиск канала
+            if strings.Contains(line, "Канал") || strings.Contains(line, "Channel") {
+                re := regexp.MustCompile(`(\d+)`)
+                if matches := re.FindStringSubmatch(line); matches != nil {
+                    channelStr = matches[1]
+                }
+                continue
+            }
+        }
+
+        // Если все данные найдены, добавляем сеть
+        if bssid != "" && signalStr != "" && channelStr != "" {
+            signal, _ := strconv.Atoi(signalStr)
+            channel, _ := strconv.Atoi(channelStr)
+            // Конвертируем процент в dBm (приблизительно)
+            signalDBm := (signal * 70 / 100) - 100
+            networks = append(networks, WifiNetwork{
+                BSSID:          bssid,
+                Channel:        channel,
+                SignalStrength: signalDBm,
+                Age:            0,
+            })
+        }
+    }
+
+    // Удаление дубликатов по BSSID
+    seen := make(map[string]bool)
+    var unique []WifiNetwork
+    for _, net := range networks {
+        if !seen[net.BSSID] {
+            seen[net.BSSID] = true
+            unique = append(unique, net)
+        }
+    }
+
+    // Сортировка по силе сигнала
+    sort.Slice(unique, func(i, j int) bool {
+        return unique[i].SignalStrength > unique[j].SignalStrength
+    })
+
+    return unique
 }
 
 // sendRequest выполняет POST запрос и возвращает как структуру, так и сырой ответ и код статуса
