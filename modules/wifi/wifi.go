@@ -1,99 +1,104 @@
+//go:build windows
+
 package wifi
 
 import (
 	"errors"
-	"fmt"
-	"sync"
+
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
 var (
-	wlanapi                         = windows.NewLazySystemDLL("wlanapi.dll")
-	procWlanOpenHandle              = wlanapi.NewProc("WlanOpenHandle")
-	procWlanCloseHandle             = wlanapi.NewProc("WlanCloseHandle")
-	procWlanEnumInterfaces          = wlanapi.NewProc("WlanEnumInterfaces")
-	procWlanScan                    = wlanapi.NewProc("WlanScan")
-	procWlanGetAvailableNetworkList = wlanapi.NewProc("WlanGetAvailableNetworkList")
-	procWlanFreeMemory              = wlanapi.NewProc("WlanFreeMemory")
-	procWlanRegisterNotification    = wlanapi.NewProc("WlanRegisterNotification")
+	wlanapi                          = windows.NewLazySystemDLL("wlanapi.dll")
+	procWlanOpenHandle               = wlanapi.NewProc("WlanOpenHandle")
+	procWlanCloseHandle              = wlanapi.NewProc("WlanCloseHandle")
+	procWlanEnumInterfaces           = wlanapi.NewProc("WlanEnumInterfaces")
+	procWlanScan                     = wlanapi.NewProc("WlanScan")
+	procWlanGetAvailableNetworkList  = wlanapi.NewProc("WlanGetAvailableNetworkList")
+	procWlanFreeMemory               = wlanapi.NewProc("WlanFreeMemory")
 )
 
 const (
-	wlanClientVersion = 2
-
-	wlanNotificationSourceACM = 0x00000008
-	wlanNotificationACMScanComplete = 7
+	wlanClientVersionXP = 1
+	wlanClientVersion   = 2
 )
 
-type wlanNotificationData struct {
-	NotificationSource uint32
-	NotificationCode   uint32
-	InterfaceGuid      windows.GUID
-	DataSize           uint32
-	DataPtr            uintptr
+type wlanInterfaceInfo struct {
+	InterfaceGuid windows.GUID
+	Description   [256]uint16
+	State         uint32
 }
 
-type notificationCallback struct {
-	ch chan windows.GUID
+type wlanInterfaceInfoList struct {
+	NumberOfItems uint32
+	Index         uint32
+	// Далее идёт массив переменной длины
 }
 
-var (
-	callbackInstance *notificationCallback
-	callbackOnce     sync.Once
-)
-
-func notificationProc(data *wlanNotificationData, context uintptr) uintptr {
-	if data.NotificationSource == wlanNotificationSourceACM &&
-		data.NotificationCode == wlanNotificationACMScanComplete {
-
-		callbackInstance.ch <- data.InterfaceGuid
-	}
-	return 0
+type wlanAvailableNetwork struct {
+	ProfileName           [256]uint16
+	Ssid                  dot11SSID
+	BssType               uint32
+	NumberOfBssids        uint32
+	Connectable           int32
+	WlanNotConnectableReason uint32
+	NumberOfPhyTypes      uint32
+	PhyTypes              [8]uint32
+	MorePhyTypes          uint32
+	SignalQuality         uint32
+	SecurityEnabled       int32
+	DefaultAuthAlgorithm  uint32
+	DefaultCipherAlgorithm uint32
+	Flags                 uint32
+	Reserved              uint32
 }
 
-func registerNotification(handle windows.Handle, ch chan windows.GUID) error {
-	callbackOnce.Do(func() {
-		callbackInstance = &notificationCallback{ch: ch}
-	})
-
-	cb := windows.NewCallback(notificationProc)
-
-	r1, _, err := procWlanRegisterNotification.Call(
-		uintptr(handle),
-		uintptr(wlanNotificationSourceACM),
-		0,
-		cb,
-		0,
-		0,
-		0,
-	)
-
-	if r1 != 0 {
-		return err
-	}
-	return nil
+type wlanAvailableNetworkList struct {
+	NumberOfItems uint32
+	Index         uint32
 }
 
-func openHandle() (windows.Handle, error) {
-	var negotiated uint32
+type dot11SSID struct {
+	SSIDLength uint32
+	SSID       [32]byte
+}
+
+type Network struct {
+	SSID          string
+	SignalQuality uint32
+	Security      bool
+}
+
+func utf16ToString(s []uint16) string {
+	return windows.UTF16ToString(s)
+}
+
+func ssidToString(ssid dot11SSID) string {
+	return string(ssid.SSID[:ssid.SSIDLength])
+}
+
+func OpenHandle() (windows.Handle, error) {
+	var negotiatedVersion uint32
 	var handle windows.Handle
 
 	r1, _, err := procWlanOpenHandle.Call(
 		uintptr(wlanClientVersion),
 		0,
-		uintptr(unsafe.Pointer(&negotiated)),
+		uintptr(unsafe.Pointer(&negotiatedVersion)),
 		uintptr(unsafe.Pointer(&handle)),
 	)
 
 	if r1 != 0 {
 		return 0, err
 	}
+
 	return handle, nil
 }
 
-func closeHandle(handle windows.Handle) {
+func CloseHandle(handle windows.Handle) {
 	procWlanCloseHandle.Call(uintptr(handle), 0)
 }
 
@@ -105,34 +110,27 @@ func enumInterfaces(handle windows.Handle) ([]windows.GUID, error) {
 		0,
 		uintptr(unsafe.Pointer(&listPtr)),
 	)
+
 	if r1 != 0 {
 		return nil, err
 	}
 	defer procWlanFreeMemory.Call(listPtr)
 
-	type header struct {
-		NumberOfItems uint32
-		Index         uint32
+	header := (*wlanInterfaceInfoList)(unsafe.Pointer(listPtr))
+	count := header.NumberOfItems
+
+	if count == 0 {
+		return nil, errors.New("no WiFi interfaces found")
 	}
 
-	type iface struct {
-		Guid windows.GUID
-		Desc [256]uint16
-		State uint32
-	}
+	result := make([]windows.GUID, 0, count)
 
-	h := (*header)(unsafe.Pointer(listPtr))
-	if h.NumberOfItems == 0 {
-		return nil, errors.New("no wifi interfaces")
-	}
+	base := listPtr + unsafe.Sizeof(*header)
+	itemSize := unsafe.Sizeof(wlanInterfaceInfo{})
 
-	result := make([]windows.GUID, 0, h.NumberOfItems)
-	base := listPtr + unsafe.Sizeof(*h)
-	itemSize := unsafe.Sizeof(iface{})
-
-	for i := uint32(0); i < h.NumberOfItems; i++ {
-		item := (*iface)(unsafe.Pointer(base + uintptr(i)*itemSize))
-		result = append(result, item.Guid)
+	for i := uint32(0); i < count; i++ {
+		item := (*wlanInterfaceInfo)(unsafe.Pointer(base + uintptr(i)*itemSize))
+		result = append(result, item.InterfaceGuid)
 	}
 
 	return result, nil
@@ -146,50 +144,72 @@ func scan(handle windows.Handle, guid windows.GUID) error {
 		0,
 		0,
 	)
+
 	if r1 != 0 {
 		return err
 	}
 	return nil
 }
 
-func waitForScan(ch chan windows.GUID, expected int) {
-	completed := 0
-	for completed < expected {
-		<-ch
-		completed++
+func getNetworks(handle windows.Handle, guid windows.GUID) ([]Network, error) {
+	var listPtr uintptr
+
+	r1, _, err := procWlanGetAvailableNetworkList.Call(
+		uintptr(handle),
+		uintptr(unsafe.Pointer(&guid)),
+		0,
+		0,
+		uintptr(unsafe.Pointer(&listPtr)),
+	)
+
+	if r1 != 0 {
+		return nil, err
 	}
+	defer procWlanFreeMemory.Call(listPtr)
+
+	header := (*wlanAvailableNetworkList)(unsafe.Pointer(listPtr))
+	count := header.NumberOfItems
+
+	networks := make([]Network, 0, count)
+
+	base := listPtr + unsafe.Sizeof(*header)
+	itemSize := unsafe.Sizeof(wlanAvailableNetwork{})
+
+	for i := uint32(0); i < count; i++ {
+		item := (*wlanAvailableNetwork)(unsafe.Pointer(base + uintptr(i)*itemSize))
+
+		networks = append(networks, Network{
+			SSID:          ssidToString(item.Ssid),
+			SignalQuality: item.SignalQuality,
+			Security:      item.SecurityEnabled != 0,
+		})
+	}
+
+	return networks, nil
 }
 
 func ScanAndList() ([]Network, error) {
-	handle, err := openHandle()
+	handle, err := OpenHandle()
 	if err != nil {
 		return nil, err
 	}
-	defer closeHandle(handle)
+	defer CloseHandle(handle)
 
 	ifaces, err := enumInterfaces(handle)
 	if err != nil {
 		return nil, err
 	}
 
-	ch := make(chan windows.GUID, len(ifaces))
+	allNetworks := []Network{}
 
-	if err := registerNotification(handle, ch); err != nil {
-		return nil, err
-	}
-
-	// Запускаем scan на всех интерфейсах
 	for _, guid := range ifaces {
 		if err := scan(handle, guid); err != nil {
 			return nil, err
 		}
 	}
 
-	// Ждём завершения сканирования
-	waitForScan(ch, len(ifaces))
-
-	// Получаем сети
-	var allNetworks []Network
+	// Асинхронный scan → ждём
+	time.Sleep(3 * time.Second)
 
 	for _, guid := range ifaces {
 		nets, err := getNetworks(handle, guid)

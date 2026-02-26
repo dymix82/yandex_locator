@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -304,7 +305,7 @@ func getPublicIP() string {
 // 		return err
 // 	}
 
-// 	// Ждём завершения сканирования
+// 	// Ждём завершения сканированияЫ
 // 	time.Sleep(3 * time.Second)
 
 // 	return nil
@@ -312,28 +313,18 @@ func getPublicIP() string {
 
 // getWifiNetworks получает список всех точек доступа через netsh
 func getWifiNetworks() []WifiNetwork {
-
-  	networks, err := wifi.ScanAndList()
+  	log.Println("  Инициируем принудительное сканирование Wi-Fi через Native API...")
+	
+	// Пытаемся выполнить сканирование через WinAPI
+	_, err := wifi.ScanAndList()
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("  Ошибка Native API: %v, используем запасной вариант\n", err)
+		// fallback: старый метод с несколькими попытками netsh
 	}
-
-	fmt.Println("Available WiFi networks:")
-	fmt.Println("----------------------------------------")
-
-	for _, n := range networks {
-		secure := "Open"
-		if n.Security {
-			secure = "Secured"
-		}
-
-		fmt.Printf(
-			"%-30s %3d%%  %s\n",
-			n.SSID,
-			n.SignalQuality,
-			secure,
-		)
-	}
+	
+	log.Println("  Сканирование запущено, ожидаем завершения (3 секунды)...")
+	time.Sleep(3 * time.Second) // Даём время на сканирование
+	
 
     cmd := exec.Command("cmd", "/c", "chcp 437 > nul && netsh wlan show networks mode=bssid")
 
