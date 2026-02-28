@@ -11,15 +11,13 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
-    "strconv"
 	"github.com/joho/godotenv"
 
-    "locator/modules/wifi"
-
-
-
+    "locator/modules/userinfo"
+	"locator/modules/wifi"
 )
 
 const (
@@ -28,8 +26,6 @@ const (
 )
 
 var yandexAPIKey string
-
-
 
 // IPAddress представляет блок IP в JSON
 type IPAddress struct {
@@ -46,7 +42,7 @@ type WifiNetwork struct {
 
 // RequestBody полный запрос к API
 type RequestBody struct {
-	IP   []IPAddress    `json:"ip"`
+	IP   []IPAddress    `json:"ip,omitempty"`  // omitempty – поле не будет добавлено, если пустое
 	Wifi []WifiNetwork `json:"wifi,omitempty"`
 }
 
@@ -59,14 +55,16 @@ type YandexResponse struct {
 		} `json:"point"`
 		Accuracy float64 `json:"accuracy"`
 	} `json:"location"`
-	Raw map[string]interface{} `json:"-"` // для хранения полного ответа
+	Raw map[string]interface{} `json:"-"`
 }
 
 // LocationResponse структура для сохранения в файл
 type LocationResponse struct {
-	Timestamp string `json:"timestamp"`
-	Hostname  string `json:"hostname"`
-	Location  struct {
+	Timestamp  string `json:"timestamp"`
+	Hostname   string `json:"hostname"`
+	Username   string `json:"username"`
+	OriginalIP string `json:"original_ip,omitempty"` // реальный IP (если был получен)
+	Location   struct {
 		Point struct {
 			Lon float64 `json:"lon"`
 			Lat float64 `json:"lat"`
@@ -93,19 +91,16 @@ func (l *Logger) Printf(format string, a ...interface{}) {
 }
 
 func (l *Logger) Errorln(a ...interface{}) {
-	// Ошибки выводим всегда
 	fmt.Fprintln(os.Stderr, a...)
 }
 
 func (l *Logger) Errorf(format string, a ...interface{}) {
-	// Ошибки выводим всегда
 	fmt.Fprintf(os.Stderr, format, a...)
 }
 
 var log Logger
 
 func init() {
-	// Загружаем .env файл
 	_ = godotenv.Load()
 	yandexAPIKey = os.Getenv("YANDEX_API_KEY")
 	if yandexAPIKey == "" {
@@ -116,10 +111,9 @@ func init() {
 }
 
 func main() {
-	// Парсим флаги командной строки
 	quiet := flag.Bool("quiet", false, "тихий режим (вывод только ошибок и кода ответа)")
 	flag.Parse()
-	
+
 	log = Logger{quiet: *quiet}
 
 	if !log.quiet {
@@ -127,7 +121,6 @@ func main() {
 		fmt.Println("===============================")
 	}
 
-	// 1. Получаем hostname
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "unknown"
@@ -135,31 +128,36 @@ func main() {
 	}
 	log.Printf("Hostname: %s\n", hostname)
 
-	// 2. Публичный IP
-	publicIP := getPublicIP()
-	if publicIP == "" {
+	// Получаем реальный публичный IP (может быть пустым)
+	realIP := getPublicIP()
+	if realIP == "" {
 		log.Errorln("Ошибка: не удалось получить публичный IP. Проверьте интернет-соединение.")
 	} else {
-		log.Printf("Публичный IP: %s\n", publicIP)
+		log.Printf("Реальный публичный IP: %s\n", realIP)
 	}
 
-	// 3. Wi-Fi сети
+	// Получаем имя активного пользователя
+	username := userinfo.GetActiveUsername()
+	log.Printf("Активный пользователь: %s\n", username)
+
+	// Определяем, нужно ли скрыть IP в запросе к API
+	hideIP := isLocalNetwork(realIP)
+	if hideIP {
+		log.Println("IP принадлежит локальной подсети 80.237.17.0/24 – поле IP не будет отправлено в API")
+	}
+
+	// Сканируем Wi-Fi сети
 	log.Println("\nСканируем Wi-Fi сети...")
 	wifiNetworks := getWifiNetworks()
 	log.Printf("Найдено уникальных Wi-Fi сетей: %d\n", len(wifiNetworks))
 
-	// 4. Проверка наличия данных
-	if len(wifiNetworks) == 0 && publicIP == "" {
-		log.Errorln("\nОшибка: нет данных для отправки.")
-		os.Exit(1)
-	}
-
-	// 5. Формирование JSON
+	// Формируем тело запроса
 	requestBody := RequestBody{
-		IP: []IPAddress{{Address: publicIP}},
+		Wifi: wifiNetworks,
 	}
-	if len(wifiNetworks) > 0 {
-		requestBody.Wifi = wifiNetworks
+	// Добавляем IP только если он не пустой и не подлежит скрытию
+	if realIP != "" && !hideIP {
+		requestBody.IP = []IPAddress{{Address: realIP}}
 	}
 
 	jsonData, err := json.MarshalIndent(requestBody, "", "  ")
@@ -170,34 +168,30 @@ func main() {
 	log.Println("\nJSON для отправки:")
 	log.Println(string(jsonData))
 
-	// 6. Отправка запроса
+	// Отправка запроса (даже если IP скрыт, Wi-Fi сети могут быть)
 	log.Println("\nОтправляем запрос на Яндекс API...")
 	resp, rawResponse, statusCode, err := sendRequest(jsonData)
 	if err != nil {
 		log.Errorf("Ошибка: %v\n", err)
 		os.Exit(1)
 	}
-	
-	// Всегда выводим код ответа
+
 	fmt.Printf("HTTP Status: %d\n", statusCode)
-	
+
 	if !log.quiet {
 		fmt.Println("Запрос успешно отправлен! (HTTP 200)")
 	}
 
-	// 7. Вывод полного ответа сервера (только если не quiet)
 	if !log.quiet {
 		fmt.Println("\nПолный ответ сервера:")
 		fmt.Println(string(rawResponse))
 	}
 
-	// 8. Вывод координат в нужном формате (только если не quiet)
 	if resp != nil && resp.Location.Point.Lat != 0 && resp.Location.Point.Lon != 0 {
 		log.Printf("\nКоординаты: %.6f, %.6f\n", resp.Location.Point.Lat, resp.Location.Point.Lon)
-		log.Printf("Ссылка на карту: https://maps.yandex.ru/?ll=%.6f,%.6f&z=17\n", 
+		log.Printf("Ссылка на карту: https://maps.yandex.ru/?ll=%.6f,%.6f&z=17\n",
 			resp.Location.Point.Lon, resp.Location.Point.Lat)
-		
-		// Вывод точности, если она есть
+
 		if resp.Location.Accuracy > 0 {
 			log.Printf("Точность: %.1f метров\n", resp.Location.Accuracy)
 		}
@@ -205,9 +199,9 @@ func main() {
 		log.Println("\nПредупреждение: координаты не найдены в ответе сервера.")
 	}
 
-	// 9. Сохранение результата в файл
+	// Сохраняем результат в файл (с оригинальным IP, даже если он скрыт в запросе)
 	if resp != nil {
-		err = saveResult(hostname, resp)
+		err = saveResult(hostname, username, realIP, resp)
 		if err != nil {
 			log.Errorf("Ошибка сохранения результата: %v\n", err)
 		} else {
@@ -215,7 +209,6 @@ func main() {
 		}
 	}
 
-	// 10. Статистика (только если не quiet)
 	printStats(wifiNetworks)
 }
 
@@ -235,194 +228,114 @@ func getPublicIP() string {
 	return strings.TrimSpace(string(ip))
 }
 
-// var (
-// 	wlanapi                   = windows.NewLazySystemDLL("wlanapi.dll")
-// 	procWlanOpenHandle        = wlanapi.NewProc("WlanOpenHandle")
-// 	procWlanEnumInterfaces    = wlanapi.NewProc("WlanEnumInterfaces")
-// 	procWlanScan              = wlanapi.NewProc("WlanScan")
-// 	procWlanGetAvailableList  = wlanapi.NewProc("WlanGetAvailableNetworkList")
-// 	procWlanFreeMemory        = wlanapi.NewProc("WlanFreeMemory")
-// 	procWlanCloseHandle       = wlanapi.NewProc("WlanCloseHandle")
-// )
-// // Принудительное сканирование через syscall
-// func ForceWifiScan() error {
-// 	var negotiatedVersion uint32
-// 	var clientHandle windows.Handle
+// isLocalNetwork проверяет, принадлежит ли IP подсети 80.237.17.0/24
+func isLocalNetwork(ip string) bool {
+	if ip == "" {
+		return false
+	}
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	return parts[0] == "80" && parts[1] == "237" && parts[2] == "17"
+}
 
-// 	// Open handle
-// 	r1, _, err := procWlanOpenHandle.Call(
-// 		uintptr(2),
-// 		0,
-// 		uintptr(unsafe.Pointer(&negotiatedVersion)),
-// 		uintptr(unsafe.Pointer(&clientHandle)),
-// 	)
-// 	if r1 != 0 {
-// 		return err
-// 	}
-// 	defer procWlanCloseHandle.Call(uintptr(clientHandle), 0)
-
-// 	// Get interfaces
-// 	var ifaceList uintptr
-// 	r1, _, err = procWlanEnumInterfaces.Call(
-// 		uintptr(clientHandle),
-// 		0,
-// 		uintptr(unsafe.Pointer(&ifaceList)),
-// 	)
-// 	if r1 != 0 {
-// 		return err
-// 	}
-// 	defer procWlanFreeMemory.Call(ifaceList)
-
-// 	// Первая интерфейсная структура (упрощённо)
-// 	type WLAN_INTERFACE_INFO struct {
-// 		InterfaceGuid windows.GUID
-// 		strInterfaceDescription [256]uint16
-// 		isState uint32
-// 	}
-
-// 	type WLAN_INTERFACE_INFO_LIST struct {
-// 		dwNumberOfItems uint32
-// 		dwIndex uint32
-// 		InterfaceInfo [1]WLAN_INTERFACE_INFO
-// 	}
-
-// 	list := (*WLAN_INTERFACE_INFO_LIST)(unsafe.Pointer(ifaceList))
-// 	if list.dwNumberOfItems == 0 {
-// 		return fmt.Errorf("no wifi interfaces found")
-// 	}
-
-// 	guid := list.InterfaceInfo[0].InterfaceGuid
-
-// 	// Force scan
-// 	r1, _, err = procWlanScan.Call(
-// 		uintptr(clientHandle),
-// 		uintptr(unsafe.Pointer(&guid)),
-// 		0,
-// 		0,
-// 		0,
-// 	)
-// 	if r1 != 0 {
-// 		return err
-// 	}
-
-// 	// Ждём завершения сканированияЫ
-// 	time.Sleep(3 * time.Second)
-
-// 	return nil
-// }
 
 // getWifiNetworks получает список всех точек доступа через netsh
 func getWifiNetworks() []WifiNetwork {
-  	log.Println("  Инициируем принудительное сканирование Wi-Fi через Native API...")
-	
-	// Пытаемся выполнить сканирование через WinAPI
+	log.Println("  Инициируем принудительное сканирование Wi-Fi через Native API...")
+
 	_, err := wifi.ScanAndList()
 	if err != nil {
 		log.Printf("  Ошибка Native API: %v, используем запасной вариант\n", err)
-		// fallback: старый метод с несколькими попытками netsh
 	}
-	
+
 	log.Println("  Сканирование запущено, ожидаем завершения (3 секунды)...")
-	time.Sleep(3 * time.Second) // Даём время на сканирование
-	
+	time.Sleep(3 * time.Second)
 
-    cmd := exec.Command("cmd", "/c", "chcp 437 > nul && netsh wlan show networks mode=bssid")
+	cmd := exec.Command("cmd", "/c", "chcp 437 > nul && netsh wlan show networks mode=bssid")
 
-    output, err := cmd.Output()
-	fmt.Println("=== RAW NETSH OUTPUT ===")
-    fmt.Println(string(output))
-    fmt.Println("=== END RAW OUTPUT ===")
-    if err != nil {
-        log.Printf("  Ошибка запуска netsh: %v\n", err)
-        return nil
-    }
+	output, err := cmd.Output()
+	// fmt.Println("=== RAW NETSH OUTPUT ===")
+	// fmt.Println(string(output))
+	// fmt.Println("=== END RAW OUTPUT ===")
+	if err != nil {
+		log.Printf("  Ошибка запуска netsh: %v\n", err)
+		return nil
+	}
 
-    // Для отладки можно раскомментировать:
-    // fmt.Println(string(output))
+	blocks := strings.Split(string(output), "\r\n\r\n")
+	var networks []WifiNetwork
 
-    // Разделяем вывод на блоки сетей (два перевода строки)
-    blocks := strings.Split(string(output), "\r\n\r\n")
-    var networks []WifiNetwork
+	for _, block := range blocks {
+		if !strings.Contains(block, "BSSID") {
+			continue
+		}
 
-    for _, block := range blocks {
-        // Блок должен содержать BSSID, иначе это не сеть
-        if !strings.Contains(block, "BSSID") {
-            continue
-        }
+		lines := strings.Split(block, "\r\n")
+		var bssid, signalStr, channelStr string
 
-        lines := strings.Split(block, "\r\n")
-        var bssid, signalStr, channelStr string
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
 
-        for _, line := range lines {
-            line = strings.TrimSpace(line)
+			if strings.Contains(line, "BSSID") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					bssid = strings.TrimSpace(parts[1])
+					if matched, _ := regexp.MatchString(`([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}`, bssid); !matched {
+						bssid = ""
+					}
+				}
+				continue
+			}
 
-            // Поиск BSSID
-            if strings.Contains(line, "BSSID") {
-                // Ожидается формат "BSSID 1 : xx:xx:xx:xx:xx:xx" или "BSSID : xx:xx..."
-                parts := strings.SplitN(line, ":", 2)
-                if len(parts) == 2 {
-                    bssid = strings.TrimSpace(parts[1])
-                    // Проверим, что это похоже на MAC-адрес (опционально)
-                    if matched, _ := regexp.MatchString(`([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}`, bssid); !matched {
-                        bssid = "" // сброс, если не похоже
-                    }
-                }
-                continue
-            }
+			if strings.Contains(line, "Сигнал") || strings.Contains(line, "Signal") {
+				re := regexp.MustCompile(`(\d+)%`)
+				if matches := re.FindStringSubmatch(line); matches != nil {
+					signalStr = matches[1]
+				}
+				continue
+			}
 
-            // Поиск сигнала (русский или английский)
-            if strings.Contains(line, "Сигнал") || strings.Contains(line, "Signal") {
-                re := regexp.MustCompile(`(\d+)%`)
-                if matches := re.FindStringSubmatch(line); matches != nil {
-                    signalStr = matches[1]
-                }
-                continue
-            }
+			if strings.Contains(line, "Канал") || strings.Contains(line, "Channel") {
+				re := regexp.MustCompile(`(\d+)`)
+				if matches := re.FindStringSubmatch(line); matches != nil {
+					channelStr = matches[1]
+				}
+				continue
+			}
+		}
 
-            // Поиск канала
-            if strings.Contains(line, "Канал") || strings.Contains(line, "Channel") {
-                re := regexp.MustCompile(`(\d+)`)
-                if matches := re.FindStringSubmatch(line); matches != nil {
-                    channelStr = matches[1]
-                }
-                continue
-            }
-        }
+		if bssid != "" && signalStr != "" && channelStr != "" {
+			signal, _ := strconv.Atoi(signalStr)
+			channel, _ := strconv.Atoi(channelStr)
+			signalDBm := (signal * 70 / 100) - 100
+			networks = append(networks, WifiNetwork{
+				BSSID:          bssid,
+				Channel:        channel,
+				SignalStrength: signalDBm,
+				Age:            0,
+			})
+		}
+	}
 
-        // Если все данные найдены, добавляем сеть
-        if bssid != "" && signalStr != "" && channelStr != "" {
-            signal, _ := strconv.Atoi(signalStr)
-            channel, _ := strconv.Atoi(channelStr)
-            // Конвертируем процент в dBm (приблизительно)
-            signalDBm := (signal * 70 / 100) - 100
-            networks = append(networks, WifiNetwork{
-                BSSID:          bssid,
-                Channel:        channel,
-                SignalStrength: signalDBm,
-                Age:            0,
-            })
-        }
-    }
+	seen := make(map[string]bool)
+	var unique []WifiNetwork
+	for _, net := range networks {
+		if !seen[net.BSSID] {
+			seen[net.BSSID] = true
+			unique = append(unique, net)
+		}
+	}
 
-    // Удаление дубликатов по BSSID
-    seen := make(map[string]bool)
-    var unique []WifiNetwork
-    for _, net := range networks {
-        if !seen[net.BSSID] {
-            seen[net.BSSID] = true
-            unique = append(unique, net)
-        }
-    }
+	sort.Slice(unique, func(i, j int) bool {
+		return unique[i].SignalStrength > unique[j].SignalStrength
+	})
 
-    // Сортировка по силе сигнала
-    sort.Slice(unique, func(i, j int) bool {
-        return unique[i].SignalStrength > unique[j].SignalStrength
-    })
-
-    return unique
+	return unique
 }
 
-// sendRequest выполняет POST запрос и возвращает как структуру, так и сырой ответ и код статуса
+// sendRequest выполняет POST запрос
 func sendRequest(jsonData []byte) (*YandexResponse, []byte, int, error) {
 	fullURL := fmt.Sprintf("%s?apikey=%s", apiURL, yandexAPIKey)
 	client := http.Client{Timeout: timeoutSec * time.Second}
@@ -447,11 +360,9 @@ func sendRequest(jsonData []byte) (*YandexResponse, []byte, int, error) {
 		return nil, body, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Парсим ответ в структуру
 	var response YandexResponse
 	err = json.Unmarshal(body, &response)
 	if err != nil {
-		// Если не удалось распарсить в структуру, всё равно возвращаем сырой ответ
 		return nil, body, resp.StatusCode, nil
 	}
 
@@ -459,36 +370,29 @@ func sendRequest(jsonData []byte) (*YandexResponse, []byte, int, error) {
 }
 
 // saveResult сохраняет результат в файл output.json
-func saveResult(hostname string, yandexResp *YandexResponse) error {
-	// Создаем структуру для сохранения
+func saveResult(hostname, username, originalIP string, yandexResp *YandexResponse) error {
 	var locationResp LocationResponse
-	
-	// Устанавливаем timestamp в формате ISO 8601
+
 	locationResp.Timestamp = time.Now().Format(time.RFC3339)
-	
-	// Устанавливаем hostname
 	locationResp.Hostname = hostname
-	
-	// Устанавливаем координаты
+	locationResp.Username = username
+	if originalIP != "" {
+		locationResp.OriginalIP = originalIP
+	}
 	locationResp.Location.Point.Lon = yandexResp.Location.Point.Lon
 	locationResp.Location.Point.Lat = yandexResp.Location.Point.Lat
-	
-	// Устанавливаем точность
 	locationResp.Location.Accuracy = yandexResp.Location.Accuracy
 
-	// Конвертируем в JSON с отступами
 	jsonData, err := json.MarshalIndent(locationResp, "", "  ")
 	if err != nil {
 		return fmt.Errorf("ошибка маршалинга JSON: %v", err)
 	}
 
-	// Сохраняем в файл
 	err = os.WriteFile("output.json", jsonData, 0644)
 	if err != nil {
 		return fmt.Errorf("ошибка записи файла: %v", err)
 	}
 
-	// Для отладки выводим сохраненный JSON (только если не quiet)
 	log.Println("\nСохраненный JSON:")
 	log.Println(string(jsonData))
 
@@ -503,7 +407,6 @@ func printStats(networks []WifiNetwork) {
 	fmt.Println("\nСтатистика:")
 	fmt.Printf("  Отправлено уникальных Wi-Fi сетей: %d\n", len(networks))
 
-	// Диапазон сигналов
 	minSig, maxSig := networks[0].SignalStrength, networks[0].SignalStrength
 	chMap := make(map[int]bool)
 	for _, n := range networks {
@@ -517,7 +420,6 @@ func printStats(networks []WifiNetwork) {
 	}
 	fmt.Printf("  Диапазон сигналов: от %d dBm до %d dBm\n", minSig, maxSig)
 
-	// Список каналов
 	channels := make([]int, 0, len(chMap))
 	for ch := range chMap {
 		channels = append(channels, ch)
