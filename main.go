@@ -15,6 +15,11 @@ import (
 	"time"
     "strconv"
 	"github.com/joho/godotenv"
+
+    "locator/modules/wifi"
+
+
+
 )
 
 const (
@@ -23,6 +28,8 @@ const (
 )
 
 var yandexAPIKey string
+
+
 
 // IPAddress представляет блок IP в JSON
 type IPAddress struct {
@@ -228,9 +235,97 @@ func getPublicIP() string {
 	return strings.TrimSpace(string(ip))
 }
 
+// var (
+// 	wlanapi                   = windows.NewLazySystemDLL("wlanapi.dll")
+// 	procWlanOpenHandle        = wlanapi.NewProc("WlanOpenHandle")
+// 	procWlanEnumInterfaces    = wlanapi.NewProc("WlanEnumInterfaces")
+// 	procWlanScan              = wlanapi.NewProc("WlanScan")
+// 	procWlanGetAvailableList  = wlanapi.NewProc("WlanGetAvailableNetworkList")
+// 	procWlanFreeMemory        = wlanapi.NewProc("WlanFreeMemory")
+// 	procWlanCloseHandle       = wlanapi.NewProc("WlanCloseHandle")
+// )
+// // Принудительное сканирование через syscall
+// func ForceWifiScan() error {
+// 	var negotiatedVersion uint32
+// 	var clientHandle windows.Handle
+
+// 	// Open handle
+// 	r1, _, err := procWlanOpenHandle.Call(
+// 		uintptr(2),
+// 		0,
+// 		uintptr(unsafe.Pointer(&negotiatedVersion)),
+// 		uintptr(unsafe.Pointer(&clientHandle)),
+// 	)
+// 	if r1 != 0 {
+// 		return err
+// 	}
+// 	defer procWlanCloseHandle.Call(uintptr(clientHandle), 0)
+
+// 	// Get interfaces
+// 	var ifaceList uintptr
+// 	r1, _, err = procWlanEnumInterfaces.Call(
+// 		uintptr(clientHandle),
+// 		0,
+// 		uintptr(unsafe.Pointer(&ifaceList)),
+// 	)
+// 	if r1 != 0 {
+// 		return err
+// 	}
+// 	defer procWlanFreeMemory.Call(ifaceList)
+
+// 	// Первая интерфейсная структура (упрощённо)
+// 	type WLAN_INTERFACE_INFO struct {
+// 		InterfaceGuid windows.GUID
+// 		strInterfaceDescription [256]uint16
+// 		isState uint32
+// 	}
+
+// 	type WLAN_INTERFACE_INFO_LIST struct {
+// 		dwNumberOfItems uint32
+// 		dwIndex uint32
+// 		InterfaceInfo [1]WLAN_INTERFACE_INFO
+// 	}
+
+// 	list := (*WLAN_INTERFACE_INFO_LIST)(unsafe.Pointer(ifaceList))
+// 	if list.dwNumberOfItems == 0 {
+// 		return fmt.Errorf("no wifi interfaces found")
+// 	}
+
+// 	guid := list.InterfaceInfo[0].InterfaceGuid
+
+// 	// Force scan
+// 	r1, _, err = procWlanScan.Call(
+// 		uintptr(clientHandle),
+// 		uintptr(unsafe.Pointer(&guid)),
+// 		0,
+// 		0,
+// 		0,
+// 	)
+// 	if r1 != 0 {
+// 		return err
+// 	}
+
+// 	// Ждём завершения сканированияЫ
+// 	time.Sleep(3 * time.Second)
+
+// 	return nil
+// }
+
 // getWifiNetworks получает список всех точек доступа через netsh
 func getWifiNetworks() []WifiNetwork {
-    log.Println("  Используем netsh для сканирования...")
+  	log.Println("  Инициируем принудительное сканирование Wi-Fi через Native API...")
+	
+	// Пытаемся выполнить сканирование через WinAPI
+	_, err := wifi.ScanAndList()
+	if err != nil {
+		log.Printf("  Ошибка Native API: %v, используем запасной вариант\n", err)
+		// fallback: старый метод с несколькими попытками netsh
+	}
+	
+	log.Println("  Сканирование запущено, ожидаем завершения (3 секунды)...")
+	time.Sleep(3 * time.Second) // Даём время на сканирование
+	
+
     cmd := exec.Command("cmd", "/c", "chcp 437 > nul && netsh wlan show networks mode=bssid")
 
     output, err := cmd.Output()
