@@ -2,3 +2,5 @@
 *.exe
 *.rar
 output.json
+*.bat
+api/server.bat

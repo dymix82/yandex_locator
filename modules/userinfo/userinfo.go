@@ -4,44 +4,51 @@ package userinfo
 
 import (
 	"os"
+	"strings"
 	"syscall"
 	"unsafe"
 )
 
-// GetActiveUsername возвращает имя пользователя активной интерактивной сессии.
-// Сначала проверяет переменные окружения USERNAME/USER (для консольного запуска).
-// Затем через WTS API перебирает все сессии и ищет активную (WTSActive).
-// Если не находит, возвращает "unknown".
+// GetActiveUsername возвращает имя пользователя, вошедшего в систему (активного или отключённого).
+// Игнорирует системные учётные записи.
 func GetActiveUsername() string {
-	// Попытка через переменные окружения (быстрый путь)
-	if username := os.Getenv("USERNAME"); username != "" {
+	// Сначала пробуем переменные окружения (если запущено из консоли пользователя)
+	if username := os.Getenv("USERNAME"); username != "" && !strings.HasSuffix(username, "$") {
 		return username
 	}
-	if username := os.Getenv("USER"); username != "" {
+	if username := os.Getenv("USER"); username != "" && !strings.HasSuffix(username, "$") {
 		return username
 	}
 
-	// Загружаем необходимые DLL
+	// Загружаем библиотеки
 	wtsapi32 := syscall.NewLazyDLL("wtsapi32.dll")
 	procWTSEnumerateSessionsW := wtsapi32.NewProc("WTSEnumerateSessionsW")
 	procWTSQuerySessionInformationW := wtsapi32.NewProc("WTSQuerySessionInformationW")
 	procWTSFreeMemory := wtsapi32.NewProc("WTSFreeMemory")
 
-	// Константы WinAPI
 	const (
 		WTS_CURRENT_SERVER_HANDLE = 0
-		WTSActive                 = 0 // Состояние сессии "активна"
-		WTSUserName               = 5 // Информационный класс – имя пользователя
+		WTSUserName               = 5
+		// Состояния сессии
+		WTSActive       = 0
+		WTSConnected    = 1
+		WTSConnectQuery = 2
+		WTSShadow       = 3
+		WTSDisconnected = 4
+		WTSIdle         = 5
+		WTSListen       = 6
+		WTSReset        = 7
+		WTSDown         = 8
+		WTSInit         = 9
 	)
 
 	var sessionInfo *byte
 	var count uint32
 
-	// Получаем список всех сессий
 	ret, _, _ := procWTSEnumerateSessionsW.Call(
 		WTS_CURRENT_SERVER_HANDLE,
-		0, // Reserved
-		1, // Version
+		0,
+		1,
 		uintptr(unsafe.Pointer(&sessionInfo)),
 		uintptr(unsafe.Pointer(&count)),
 	)
@@ -50,36 +57,54 @@ func GetActiveUsername() string {
 	}
 	defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(sessionInfo)))
 
-	// Структура WTS_SESSION_INFO (согласно документации)
 	type WTS_SESSION_INFO struct {
 		SessionID      uint32
 		WinStationName *uint16
 		State          uint32
 	}
 
-	// Перебираем сессии
+	// Массив допустимых состояний – любое, кроме служебных (Listen, Idle и т.д.)
+	// На практике нам подойдут Active, Connected, Disconnected
+	validStates := map[uint32]bool{
+		WTSActive:       true,
+		WTSConnected:    true,
+		WTSDisconnected: true,
+	}
+
 	for i := uint32(0); i < count; i++ {
-		// Получаем указатель на i-ю структуру
 		item := (*WTS_SESSION_INFO)(unsafe.Pointer(
 			uintptr(unsafe.Pointer(sessionInfo)) + uintptr(i)*unsafe.Sizeof(WTS_SESSION_INFO{}),
 		))
 
-		if item.State == WTSActive {
-			// Получаем имя пользователя для этой сессии
-			var userName *uint16
-			var bytes uint32
-			ret, _, _ = procWTSQuerySessionInformationW.Call(
-				WTS_CURRENT_SERVER_HANDLE,
-				uintptr(item.SessionID),
-				WTSUserName,
-				uintptr(unsafe.Pointer(&userName)),
-				uintptr(unsafe.Pointer(&bytes)),
-			)
-			if ret != 0 && userName != nil {
-				defer procWTSFreeMemory.Call(uintptr(unsafe.Pointer(userName)))
-				return syscall.UTF16ToString((*[1 << 20]uint16)(unsafe.Pointer(userName))[:bytes/2])
-			}
+		if !validStates[item.State] {
+			continue
 		}
+
+		var userName *uint16
+		var bytes uint32
+		ret, _, _ = procWTSQuerySessionInformationW.Call(
+			WTS_CURRENT_SERVER_HANDLE,
+			uintptr(item.SessionID),
+			WTSUserName,
+			uintptr(unsafe.Pointer(&userName)),
+			uintptr(unsafe.Pointer(&bytes)),
+		)
+		if ret == 0 || userName == nil {
+			continue
+		}
+		name := syscall.UTF16ToString((*[1 << 20]uint16)(unsafe.Pointer(userName))[:bytes/2])
+		procWTSFreeMemory.Call(uintptr(unsafe.Pointer(userName)))
+
+		// Исключаем системные имена
+		if name != "" && !strings.HasSuffix(name, "$") &&
+			name != "SYSTEM" && name != "LOCAL SERVICE" && name != "NETWORK SERVICE" {
+			return name
+		}
+	}
+
+	// Если ничего не нашли, пробуем через переменные окружения ещё раз (на случай, если раньше отсекли из-за $)
+	if username := os.Getenv("USERNAME"); username != "" {
+		return username
 	}
 	return "unknown"
 }
