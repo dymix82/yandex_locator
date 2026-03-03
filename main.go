@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -15,16 +16,22 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sys/windows/registry"
+
 	"locator/modules/userinfo"
 	"locator/modules/wifi"
+
+	"github.com/kardianos/service"
 )
 
 const (
-	defaultServerURL = "http://localhost:8080/api/locate" // по умолчанию для тестов
+	defaultServerURL = "http://localhost:8080/api/locate"
 	timeoutSec       = 10
+	regKeyPath       = `SOFTWARE\LocatorClient`
+	regValueName     = "ServerURL"
 )
 
-// WifiNetwork структура для одной точки доступа (такая же, как на сервере)
+// WifiNetwork структура для одной точки доступа
 type WifiNetwork struct {
 	BSSID          string `json:"bssid"`
 	SignalStrength int    `json:"signal_strength"`
@@ -32,22 +39,15 @@ type WifiNetwork struct {
 	Channel        int    `json:"channel"`
 }
 
-// ClientRequest структура запроса к вашему серверу
+// ClientRequest структура запроса к серверу
 type ClientRequest struct {
 	Hostname   string        `json:"hostname"`
 	Username   string        `json:"username"`
-	OriginalIP string        `json:"original_ip,omitempty"` // реальный IP клиента (если получен)
+	OriginalIP string        `json:"original_ip,omitempty"`
 	Wifi       []WifiNetwork `json:"wifi,omitempty"`
 }
 
-// ServerResponse ожидаемый ответ от сервера (может содержать координаты или статус)
-type ServerResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
-	// При желании можно добавить поля location, если сервер их возвращает
-}
-
-// Logger для условного логирования
+// Logger для условного логирования (только для ручного режима)
 type Logger struct {
 	quiet bool
 }
@@ -72,47 +72,65 @@ func (l *Logger) Errorf(format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, format, a...)
 }
 
-var log Logger
+// program реализует интерфейс service.Service
+type program struct {
+	stopChan chan struct{}
+}
 
-func main() {
-	// Определяем флаги
-	serverURL := flag.String("server", defaultServerURL, "URL сервера для отправки данных (например, http://192.168.1.100:8080/api/locate)")
-	quiet := flag.Bool("quiet", false, "тихий режим (вывод только ошибок)")
-	flag.Parse()
+func (p *program) Start(s service.Service) error {
+	p.stopChan = make(chan struct{})
+	go p.run()
+	return nil
+}
 
-	log = Logger{quiet: *quiet}
+func (p *program) Stop(s service.Service) error {
+	close(p.stopChan)
+	return nil
+}
 
-	if !log.quiet {
-		fmt.Println("Клиент отправки геоданных на сервер")
-		fmt.Println("=====================================")
+func (p *program) run() {
+	// Немедленно выполняем первую отправку
+	p.execute()
+
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.stopChan:
+			return
+		case <-ticker.C:
+			p.execute()
+		}
+	}
+}
+
+func (p *program) execute() {
+	// Читаем URL из реестра
+	serverURL, err := getServerURLFromRegistry()
+	if err != nil {
+		log.Printf("Failed to read registry: %v", err)
+		return
+	}
+	if serverURL == "" {
+		log.Printf("Server URL is empty in registry, using default")
+		serverURL = defaultServerURL
 	}
 
-	// 1. Получаем hostname
+	// Получаем данные
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "unknown"
-		log.Errorf("Предупреждение: не удалось получить hostname: %v\n", err)
+		log.Printf("Warning: cannot get hostname: %v", err)
 	}
-	log.Printf("Hostname: %s\n", hostname)
-
-	// 2. Получаем имя активного пользователя
 	username := userinfo.GetActiveUsername()
-	log.Printf("Активный пользователь: %s\n", username)
-
-	// 3. Получаем реальный публичный IP (может быть пустым)
 	realIP := getPublicIP()
 	if realIP == "" {
-		log.Errorln("Ошибка: не удалось получить публичный IP. Проверьте интернет-соединение.")
-	} else {
-		log.Printf("Реальный публичный IP: %s\n", realIP)
+		log.Printf("Warning: cannot get public IP")
 	}
-
-	// 4. Сканируем Wi-Fi сети
-	log.Println("\nСканируем Wi-Fi сети...")
 	wifiNetworks := getWifiNetworks()
-	log.Printf("Найдено уникальных Wi-Fi сетей: %d\n", len(wifiNetworks))
 
-	// 5. Формируем запрос к серверу
+	// Формируем запрос
 	clientReq := ClientRequest{
 		Hostname:   hostname,
 		Username:   username,
@@ -120,35 +138,43 @@ func main() {
 		Wifi:       wifiNetworks,
 	}
 
-	jsonData, err := json.MarshalIndent(clientReq, "", "  ")
+	jsonData, err := json.Marshal(clientReq)
 	if err != nil {
-		log.Errorf("Ошибка формирования JSON: %v\n", err)
-		os.Exit(1)
-	}
-	log.Println("\nJSON для отправки на сервер:")
-	log.Println(string(jsonData))
-
-	// 6. Отправка запроса на сервер
-	log.Printf("\nОтправляем данные на сервер %s...\n", *serverURL)
-	statusCode, responseBody, err := sendToServer(*serverURL, jsonData)
-	if err != nil {
-		log.Errorf("Ошибка при отправке: %v\n", err)
-		os.Exit(1)
+		log.Printf("Failed to marshal request: %v", err)
+		return
 	}
 
-	fmt.Printf("HTTP Status: %d\n", statusCode)
-
-	if statusCode == http.StatusOK {
-		log.Println("Данные успешно отправлены на сервер")
+	// Отправляем
+	statusCode, responseBody, err := sendToServer(serverURL, jsonData)
+	if err != nil {
+		log.Printf("Failed to send data: %v", err)
+		return
+	}
+	if statusCode != http.StatusOK {
+		log.Printf("Server returned %d: %s", statusCode, string(responseBody))
 	} else {
-		log.Printf("Сервер вернул ошибку: %s\n", string(responseBody))
+		log.Printf("Data sent successfully, server response: %s", string(responseBody))
 	}
+}
 
-	// 7. Если есть тело ответа, выводим его (не в quiet-режиме)
-	if !log.quiet && len(responseBody) > 0 {
-		fmt.Println("\nОтвет сервера:")
-		fmt.Println(string(responseBody))
+// Функции для работы с реестром
+func getServerURLFromRegistry() (string, error) {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, regKeyPath, registry.QUERY_VALUE)
+	if err != nil {
+		return "", err
 	}
+	defer k.Close()
+	url, _, err := k.GetStringValue(regValueName)
+	return url, err
+}
+
+func setServerURLToRegistry(url string) error {
+	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, regKeyPath, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	return k.SetStringValue(regValueName, url)
 }
 
 // getPublicIP запрашивает внешний IP клиента
@@ -159,7 +185,6 @@ func getPublicIP() string {
 		return ""
 	}
 	defer resp.Body.Close()
-
 	ip, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return ""
@@ -167,7 +192,7 @@ func getPublicIP() string {
 	return strings.TrimSpace(string(ip))
 }
 
-// getWifiNetworks получает список всех точек доступа через netsh (без изменений)
+// getWifiNetworks получает список всех точек доступа через netsh
 func getWifiNetworks() []WifiNetwork {
 	log.Println("  Инициируем принудительное сканирование Wi-Fi через Native API...")
 
@@ -278,4 +303,144 @@ func sendToServer(url string, jsonData []byte) (int, []byte, error) {
 		return resp.StatusCode, nil, err
 	}
 	return resp.StatusCode, body, nil
+}
+
+// runOnce выполняет одноразовую отправку (для ручного режима)
+func runOnce(serverURL string, quiet bool) {
+	logger := Logger{quiet: quiet}
+
+	if !logger.quiet {
+		fmt.Println("Клиент отправки геоданных на сервер (одноразовый режим)")
+		fmt.Println("========================================================")
+	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+		logger.Errorf("Предупреждение: не удалось получить hostname: %v\n", err)
+	}
+	logger.Printf("Hostname: %s\n", hostname)
+
+	username := userinfo.GetActiveUsername()
+	logger.Printf("Активный пользователь: %s\n", username)
+
+	realIP := getPublicIP()
+	if realIP == "" {
+		logger.Errorln("Ошибка: не удалось получить публичный IP. Проверьте интернет-соединение.")
+	} else {
+		logger.Printf("Реальный публичный IP: %s\n", realIP)
+	}
+
+	logger.Println("\nСканируем Wi-Fi сети...")
+	wifiNetworks := getWifiNetworks()
+	logger.Printf("Найдено уникальных Wi-Fi сетей: %d\n", len(wifiNetworks))
+
+	clientReq := ClientRequest{
+		Hostname:   hostname,
+		Username:   username,
+		OriginalIP: realIP,
+		Wifi:       wifiNetworks,
+	}
+
+	jsonData, err := json.MarshalIndent(clientReq, "", "  ")
+	if err != nil {
+		logger.Errorf("Ошибка формирования JSON: %v\n", err)
+		return
+	}
+	logger.Println("\nJSON для отправки на сервер:")
+	logger.Println(string(jsonData))
+
+	logger.Printf("\nОтправляем данные на сервер %s...\n", serverURL)
+	statusCode, responseBody, err := sendToServer(serverURL, jsonData)
+	if err != nil {
+		logger.Errorf("Ошибка при отправке: %v\n", err)
+		return
+	}
+
+	fmt.Printf("HTTP Status: %d\n", statusCode)
+
+	if statusCode == http.StatusOK {
+		logger.Println("Данные успешно отправлены на сервер")
+	} else {
+		logger.Printf("Сервер вернул ошибку: %s\n", string(responseBody))
+	}
+
+	if !logger.quiet && len(responseBody) > 0 {
+		fmt.Println("\nОтвет сервера:")
+		fmt.Println(string(responseBody))
+	}
+}
+
+func main() {
+	// Настройка службы
+	svcConfig := &service.Config{
+		Name:        "LocatorClient",
+		DisplayName: "Locator Client Service",
+		Description: "Собирает геоданные и отправляет на сервер",
+	}
+
+	prg := &program{}
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Обработка команд управления службой
+	if len(os.Args) > 1 {
+		cmd := os.Args[1]
+		switch cmd {
+		case "install":
+			if len(os.Args) < 3 {
+				fmt.Println("Использование: client.exe install <server_url>")
+				return
+			}
+			url := os.Args[2]
+			if err := setServerURLToRegistry(url); err != nil {
+				fmt.Printf("Ошибка записи в реестр: %v\n", err)
+				return
+			}
+			if err := s.Install(); err != nil {
+				fmt.Printf("Ошибка установки службы: %v\n", err)
+				return
+			}
+			fmt.Println("Служба успешно установлена.")
+			return
+		case "uninstall":
+			if err := s.Uninstall(); err != nil {
+				fmt.Printf("Ошибка удаления службы: %v\n", err)
+				return
+			}
+			fmt.Println("Служба успешно удалена.")
+			return
+		case "start":
+			if err := s.Start(); err != nil {
+				fmt.Printf("Ошибка запуска службы: %v\n", err)
+				return
+			}
+			fmt.Println("Служба запущена.")
+			return
+		case "stop":
+			if err := s.Stop(); err != nil {
+				fmt.Printf("Ошибка остановки службы: %v\n", err)
+				return
+			}
+			fmt.Println("Служба остановлена.")
+			return
+		case "run":
+			// Ручной режим (для отладки)
+			serverURL := flag.String("server", defaultServerURL, "URL сервера")
+			quiet := flag.Bool("quiet", false, "тихий режим")
+			flag.Parse()
+			runOnce(*serverURL, *quiet)
+			return
+		default:
+			fmt.Printf("Неизвестная команда: %s\n", cmd)
+			return
+		}
+	}
+
+	// Запуск как служба (без аргументов)
+	if err := s.Run(); err != nil {
+		log.Fatal(err)
+	}
 }
