@@ -18,17 +18,17 @@ import (
 
 	"golang.org/x/sys/windows/registry"
 
+	"github.com/kardianos/service"
 	"locator/modules/userinfo"
 	"locator/modules/wifi"
-
-	"github.com/kardianos/service"
 )
 
 const (
 	defaultServerURL = "http://localhost:8080/api/locate"
 	timeoutSec       = 10
 	regKeyPath       = `SOFTWARE\LocatorClient`
-	regValueName     = "ServerURL"
+	regURLName       = "ServerURL"
+	regTokenName     = "Token"
 )
 
 // WifiNetwork структура для одной точки доступа
@@ -47,7 +47,7 @@ type ClientRequest struct {
 	Wifi       []WifiNetwork `json:"wifi,omitempty"`
 }
 
-// Logger для условного логирования (только для ручного режима)
+// Logger для условного логирования (только ручной режим)
 type Logger struct {
 	quiet bool
 }
@@ -89,10 +89,10 @@ func (p *program) Stop(s service.Service) error {
 }
 
 func (p *program) run() {
-	// Немедленно выполняем первую отправку
+	// Первая отправка сразу после старта
 	p.execute()
 
-	ticker := time.NewTicker(24 * time.Hour)
+	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
 	for {
@@ -106,8 +106,8 @@ func (p *program) run() {
 }
 
 func (p *program) execute() {
-	// Читаем URL из реестра
-	serverURL, err := getServerURLFromRegistry()
+	// Читаем URL и токен из реестра
+	serverURL, token, err := getConfigFromRegistry()
 	if err != nil {
 		log.Printf("Failed to read registry: %v", err)
 		return
@@ -115,6 +115,9 @@ func (p *program) execute() {
 	if serverURL == "" {
 		log.Printf("Server URL is empty in registry, using default")
 		serverURL = defaultServerURL
+	}
+	if token == "" {
+		log.Printf("Token is empty in registry, requests will be unauthorized")
 	}
 
 	// Получаем данные
@@ -144,8 +147,8 @@ func (p *program) execute() {
 		return
 	}
 
-	// Отправляем
-	statusCode, responseBody, err := sendToServer(serverURL, jsonData)
+	// Отправляем с токеном
+	statusCode, responseBody, err := sendToServer(serverURL, token, jsonData)
 	if err != nil {
 		log.Printf("Failed to send data: %v", err)
 		return
@@ -158,23 +161,39 @@ func (p *program) execute() {
 }
 
 // Функции для работы с реестром
-func getServerURLFromRegistry() (string, error) {
+func getConfigFromRegistry() (string, string, error) {
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, regKeyPath, registry.QUERY_VALUE)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer k.Close()
-	url, _, err := k.GetStringValue(regValueName)
-	return url, err
+
+	url, _, err := k.GetStringValue(regURLName)
+	if err != nil {
+		return "", "", err
+	}
+	token, _, err := k.GetStringValue(regTokenName)
+	if err != nil {
+		// токен может отсутствовать (старая установка)
+		token = ""
+	}
+	return url, token, nil
 }
 
-func setServerURLToRegistry(url string) error {
+func setConfigToRegistry(url, token string) error {
 	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, regKeyPath, registry.SET_VALUE)
 	if err != nil {
 		return err
 	}
 	defer k.Close()
-	return k.SetStringValue(regValueName, url)
+
+	if err := k.SetStringValue(regURLName, url); err != nil {
+		return err
+	}
+	if err := k.SetStringValue(regTokenName, token); err != nil {
+		return err
+	}
+	return nil
 }
 
 // getPublicIP запрашивает внешний IP клиента
@@ -192,7 +211,7 @@ func getPublicIP() string {
 	return strings.TrimSpace(string(ip))
 }
 
-// getWifiNetworks получает список всех точек доступа через netsh
+// getWifiNetpoints получает список всех точек доступа через netsh
 func getWifiNetworks() []WifiNetwork {
 	log.Println("  Инициируем принудительное сканирование Wi-Fi через Native API...")
 
@@ -283,14 +302,17 @@ func getWifiNetworks() []WifiNetwork {
 	return unique
 }
 
-// sendToServer отправляет POST-запрос на указанный URL
-func sendToServer(url string, jsonData []byte) (int, []byte, error) {
+// sendToServer отправляет POST-запрос с токеном
+func sendToServer(url, token string, jsonData []byte) (int, []byte, error) {
 	client := http.Client{Timeout: timeoutSec * time.Second}
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -306,7 +328,7 @@ func sendToServer(url string, jsonData []byte) (int, []byte, error) {
 }
 
 // runOnce выполняет одноразовую отправку (для ручного режима)
-func runOnce(serverURL string, quiet bool) {
+func runOnce(serverURL, token string, quiet bool) {
 	logger := Logger{quiet: quiet}
 
 	if !logger.quiet {
@@ -351,7 +373,7 @@ func runOnce(serverURL string, quiet bool) {
 	logger.Println(string(jsonData))
 
 	logger.Printf("\nОтправляем данные на сервер %s...\n", serverURL)
-	statusCode, responseBody, err := sendToServer(serverURL, jsonData)
+	statusCode, responseBody, err := sendToServer(serverURL, token, jsonData)
 	if err != nil {
 		logger.Errorf("Ошибка при отправке: %v\n", err)
 		return
@@ -390,12 +412,14 @@ func main() {
 		cmd := os.Args[1]
 		switch cmd {
 		case "install":
-			if len(os.Args) < 3 {
-				fmt.Println("Использование: client.exe install <server_url>")
+			if len(os.Args) < 4 {
+				fmt.Println("Использование: client.exe install <server_url> <token>")
+				fmt.Println("Пример: client.exe install http://93.77.187.76:8080/api/locate mysecrettoken")
 				return
 			}
 			url := os.Args[2]
-			if err := setServerURLToRegistry(url); err != nil {
+			token := os.Args[3]
+			if err := setConfigToRegistry(url, token); err != nil {
 				fmt.Printf("Ошибка записи в реестр: %v\n", err)
 				return
 			}
@@ -427,11 +451,13 @@ func main() {
 			fmt.Println("Служба остановлена.")
 			return
 		case "run":
-			// Ручной режим (для отладки)
-			serverURL := flag.String("server", defaultServerURL, "URL сервера")
-			quiet := flag.Bool("quiet", false, "тихий режим")
-			flag.Parse()
-			runOnce(*serverURL, *quiet)
+			// Исправлено: отдельный набор флагов
+			runCmd := flag.NewFlagSet("run", flag.ExitOnError)
+			serverURL := runCmd.String("server", defaultServerURL, "URL сервера")
+			token := runCmd.String("token", "", "токен авторизации")
+			quiet := runCmd.Bool("quiet", false, "тихий режим")
+			runCmd.Parse(os.Args[2:])
+			runOnce(*serverURL, *token, *quiet)
 			return
 		default:
 			fmt.Printf("Неизвестная команда: %s\n", cmd)
@@ -439,7 +465,7 @@ func main() {
 		}
 	}
 
-	// Запуск как служба (без аргументов)
+	// Запуск как служба
 	if err := s.Run(); err != nil {
 		log.Fatal(err)
 	}
